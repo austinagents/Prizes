@@ -1,7 +1,5 @@
 require('dotenv').config();
 
-const crypto = require('crypto');
-
 const {
   Client,
   GatewayIntentBits,
@@ -24,7 +22,10 @@ const {
   createGiveaway,
   setGiveawayMessageId,
   getGiveaway,
-  getActiveGiveaways,
+  getPendingGiveaways,
+  prepareGiveawayEnding,
+  getSavedWinners,
+  setAnnouncementMessageId,
   markGiveawayEnded,
   addEntry,
   getEntries,
@@ -78,110 +79,145 @@ function buildGiveawayEmbed(giveaway, entryCount = 0, ended = false) {
   return embed;
 }
 
-function pickRandomWinners(entries, winnerCount) {
-  const pool = [...entries];
-  const winners = [];
 
-  const count = Math.min(winnerCount, pool.length);
+function viewEntriesRow(giveawayId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`view_entries:${giveawayId}`)
+      .setLabel('View Entries')
+      .setStyle(ButtonStyle.Secondary)
+  );
+}
 
-  for (let i = 0; i < count; i++) {
-    const index = crypto.randomInt(pool.length);
-    winners.push(pool[index]);
-    pool.splice(index, 1);
+function buildEntriesResponse(giveaway, requestedPage = 0) {
+  const entries = getEntries(giveaway.id);
+  const pageSize = 25;
+  const pages = Math.max(1, Math.ceil(entries.length / pageSize));
+  const page = Math.max(0, Math.min(requestedPage, pages - 1));
+  const onPage = entries.slice(page * pageSize, (page + 1) * pageSize);
+  const lines = onPage.map((entry, offset) =>
+    `${page * pageSize + offset + 1}. <@${entry.user_id}>`
+  );
+  const content = [
+    `📋 **Entries — ${giveaway.product_name}**`,
+    `**${entries.length} total** · Page ${page + 1}/${pages}`,
+    '',
+    lines.length ? lines.join('\n') : 'No entries.',
+  ].join('\n');
+
+  const components = [];
+  if (pages > 1) {
+    components.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`entries_page:${giveaway.id}:${page - 1}`)
+        .setLabel('Previous')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page === 0),
+      new ButtonBuilder()
+        .setCustomId(`entries_page:${giveaway.id}:${page + 1}`)
+        .setLabel('Next')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page + 1 >= pages)
+    ));
   }
 
-  return winners;
+  return { content, components, allowedMentions: { parse: [] } };
+}
+
+function announcementMarker(giveawayId) {
+  return `Prizes giveaway #${giveawayId} results`;
+}
+
+// Check for an announcement whose Discord reply was lost before SQLite recorded
+// its message ID. We scan back to the giveaway's scheduled end, up to 1,000 messages.
+async function findExistingAnnouncement(channel, giveaway) {
+  let before;
+  for (let i = 0; i < 10; i++) {
+    const options = before ? { limit: 100, before } : { limit: 100 };
+    const messages = await channel.messages.fetch(options);
+    if (!messages.size) break;
+
+    const existing = messages.find((message) =>
+      message.author?.id === client.user.id &&
+      message.embeds.some((embed) =>
+        embed.footer?.text === announcementMarker(giveaway.id)
+      )
+    );
+    if (existing) return existing;
+
+    const oldest = messages.last();
+    if (!oldest || oldest.createdTimestamp < Number(giveaway.ends_at) - 60000) break;
+    before = oldest.id;
+  }
+  return null;
 }
 
 async function endGiveaway(giveaway) {
-  if (endingGiveaways.has(giveaway.id)) {
-    return;
-  }
-
+  if (endingGiveaways.has(giveaway.id)) return;
   endingGiveaways.add(giveaway.id);
 
   try {
-    const freshGiveaway = getGiveaway(giveaway.id);
+    const fresh = getGiveaway(giveaway.id);
+    if (!fresh || !['active', 'ending'].includes(fresh.status)) return;
 
-    if (!freshGiveaway || freshGiveaway.status !== 'active') {
-      return;
-    }
-
+    // Durable selection BEFORE attempting Discord I/O.
+    const ending = prepareGiveawayEnding(giveaway.id);
     const entries = getEntries(giveaway.id);
-    const winners = pickRandomWinners(
-      entries,
-      Number(giveaway.winner_count)
-    );
-
-    markGiveawayEnded(giveaway.id);
-
-    const channel = await client.channels.fetch(giveaway.channel_id);
+    const winners = getSavedWinners(giveaway.id);
+    const channel = await client.channels.fetch(ending.channel_id);
 
     if (!channel || !channel.isTextBased()) {
-      console.error(
-        `Could not fetch giveaway channel for giveaway ${giveaway.id}`
-      );
-      return;
+      throw new Error(`Could not fetch giveaway channel for giveaway ${giveaway.id}`);
     }
 
-    if (giveaway.message_id) {
+    // Publish a separate winners message, with a stable nonce and marker.
+    // Saved message IDs stop routine retries from posting duplicates.
+    if (!ending.announcement_message_id) {
+      const winnerMentions = winners.map(({ user_id }) => `<@${user_id}>`).join(' ');
+      const winnerText = winners.length
+        ? `🎉 **Congrats ${winnerMentions}, you won ${ending.product_name}!**`
+        : `**${ending.product_name}** ended with no entries.`;
+      const embed = new EmbedBuilder()
+        .setTitle(winners.length ? '🏆 Giveaway Winners' : '🎉 Giveaway Ended')
+        .setDescription(winnerText)
+        .setImage(ending.image_url)
+        .setFooter({ text: announcementMarker(ending.id) });
+
+      let announcement = await findExistingAnnouncement(channel, ending);
+      if (!announcement) {
+        announcement = await channel.send({
+          content: winners.length ? winnerMentions : `🎉 ${ending.product_name} ended with no entries.`,
+          embeds: [embed],
+          components: [viewEntriesRow(ending.id)],
+          nonce: `prize-results-${ending.id}`,
+          enforceNonce: true,
+        });
+      }
+      setAnnouncementMessageId(ending.id, announcement.id);
+    }
+
+    // Replace the original Enter Giveaway button with View Entries.
+    // If this edit fails transiently, next check retries the edit without
+    // reselecting winners or sending another winner announcement.
+    if (ending.message_id) {
       try {
-        const message = await channel.messages.fetch(giveaway.message_id);
-
-        const disabledButton = new ButtonBuilder()
-          .setCustomId(`enter_giveaway:${giveaway.id}`)
-          .setLabel('Giveaway Ended')
-          .setStyle(ButtonStyle.Secondary)
-          .setDisabled(true);
-
-        const row = new ActionRowBuilder().addComponents(disabledButton);
-
+        const message = await channel.messages.fetch(ending.message_id);
         await message.edit({
-          embeds: [
-            buildGiveawayEmbed(
-              giveaway,
-              entries.length,
-              true
-            ),
-          ],
-          components: [row],
+          embeds: [buildGiveawayEmbed(ending, entries.length, true)],
+          components: [viewEntriesRow(ending.id)],
         });
       } catch (error) {
-        console.error(
-          `Could not update giveaway message ${giveaway.id}:`,
-          error
-        );
+        // The original announcement was deleted: results still have View Entries.
+        if (error.code !== 10008) throw error;
+        console.warn(`Original giveaway message ${ending.message_id} was deleted`);
       }
     }
 
-    if (winners.length === 0) {
-      await channel.send({
-        content: `🎉 **${giveaway.product_name}** giveaway ended with no entries.`,
-      });
-
-      return;
-    }
-
-    const winnerMentions = winners
-      .map((entry) => `<@${entry.user_id}>`)
-      .join(' ');
-
-    const winnerText =
-      winners.length === 1
-        ? `🎉 **Congrats ${winnerMentions}, you won ${giveaway.product_name}!**`
-        : `🎉 **Congrats ${winnerMentions}, you won ${giveaway.product_name}!**`;
-
-    const winnerEmbed = new EmbedBuilder()
-      .setTitle('🏆 Giveaway Winner')
-      .setDescription(winnerText)
-      .setImage(giveaway.image_url);
-
-    await channel.send({
-      content: winnerMentions,
-      embeds: [winnerEmbed],
-    });
+    markGiveawayEnded(ending.id);
+    console.log(`Giveaway ${ending.id} completed; saved winners: ${winners.length}`);
   } catch (error) {
-    console.error(`Failed to end giveaway ${giveaway.id}:`, error);
+    // Keep status='ending'; the scheduler will retry. Winners cannot change.
+    console.error(`Failed to finish giveaway ${giveaway.id}; will retry:`, error);
   } finally {
     endingGiveaways.delete(giveaway.id);
   }
@@ -189,13 +225,9 @@ async function endGiveaway(giveaway) {
 
 async function checkExpiredGiveaways() {
   try {
-    const giveaways = getActiveGiveaways();
-    const now = Date.now();
-
+    const giveaways = getPendingGiveaways();
     for (const giveaway of giveaways) {
-      if (Number(giveaway.ends_at) <= now) {
-        await endGiveaway(giveaway);
-      }
+      await endGiveaway(giveaway);
     }
   } catch (error) {
     console.error('Failed checking expired giveaways:', error);
@@ -494,6 +526,34 @@ client.on('interactionCreate', async (interaction) => {
         components: [],
       });
 
+      return;
+    }
+
+
+    if (
+      interaction.isButton() &&
+      (
+        interaction.customId.startsWith('view_entries:') ||
+        interaction.customId.startsWith('entries_page:')
+      )
+    ) {
+      const [action, id, pageValue] = interaction.customId.split(':');
+      const giveaway = getGiveaway(Number(id));
+      if (!giveaway || giveaway.status === 'active') {
+        await interaction.reply({
+          content: 'Entries become available after the giveaway ends.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const page = action === 'entries_page' ? Number(pageValue) : 0;
+      const response = buildEntriesResponse(giveaway, Number.isSafeInteger(page) ? page : 0);
+      if (action === 'view_entries') {
+        await interaction.reply({ ...response, ephemeral: true });
+      } else {
+        await interaction.update(response);
+      }
       return;
     }
 
