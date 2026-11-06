@@ -36,4 +36,19 @@ db.exec(`
   );
 `);
 
+// Additive migrations: preserve existing giveaway and entry data.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS giveaway_winners (
+    giveaway_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (giveaway_id, user_id),
+    UNIQUE (giveaway_id, position)
+  );
+`);
+
+if (!db.pragma('table_info(giveaways)').some((column) => column.name === 'announcement_message_id')) {
+  db.exec('ALTER TABLE giveaways ADD COLUMN announcement_message_id TEXT');
+}
+
 module.exports = db;
