@@ -102,8 +102,8 @@ function buildEntriesResponse(giveaway, requestedPage = 0) {
     `📋 **Entries — ${giveaway.product_name}**`,
     `**${entries.length} total** · Page ${page + 1}/${pages}`,
     '',
-    lines.length ? lines.join('\\n') : 'No entries.',
-  ].join('\\n');
+    lines.length ? lines.join('\n') : 'No entries.',
+  ].join('\n');
 
   const components = [];
   if (pages > 1) {
